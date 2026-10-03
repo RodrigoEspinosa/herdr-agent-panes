@@ -99,6 +99,20 @@ herdr-agent-panes/install.sh              # or: install.sh --uninstall
 This also symlinks `herdr-run` and `herdr-agent-panes` into `~/.local/bin`
 (`BIN_DIR=...` to change). `git pull` updates the hooks in place.
 
+## Keybinding
+
+`herdr-agent-panes install` also links the repo as a herdr plugin with one
+action, `herdr-agent-panes.arrange`, which tidies the focused tab. Bind it in
+`~/.config/herdr/config.toml`, then run `herdr server reload-config`:
+
+```toml
+[[keys.command]]
+key = "cmd+shift+a"
+type = "plugin_action"
+command = "herdr-agent-panes.arrange"
+description = "arrange panes around the agent"
+```
+
 ## Configure
 
 Copy `config.example.sh` to `~/.config/herdr-agent-panes/config.sh` and
