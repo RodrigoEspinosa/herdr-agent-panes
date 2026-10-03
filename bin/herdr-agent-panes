@@ -11,6 +11,7 @@
 #   PATH        herdr-run and herdr-agent-panes symlinks in $BIN_DIR (default
 #               ~/.local/bin); skipped for Homebrew, which links them itself
 #   Claude Code adds the root as a marketplace and installs the plugin
+#   herdr       links the root as a herdr plugin (the `arrange` action)
 #   Codex       PreToolUse guard in ~/.codex/hooks.json and the instructions as
 #               a marked block in ~/.codex/AGENTS.md
 #
@@ -84,6 +85,21 @@ claude_uninstall() {
   say "claude: plugin and marketplace removed"
 }
 
+herdr_link() {
+  command -v herdr >/dev/null || { say "herdr: not found, skipped"; return; }
+  local cur
+  cur=$(herdr plugin list --json 2>/dev/null \
+    | jq -r --arg n "$NAME" '.result.plugins[]? | select(.plugin_id == $n) | .plugin_root' || true)
+  if [ "$cur" = "$ROOT" ]; then say "herdr: plugin already linked"; return; fi
+  [ -n "$cur" ] && herdr plugin unlink "$NAME" >/dev/null 2>&1
+  if herdr plugin link "$ROOT" >/dev/null; then say "herdr: plugin linked (action: $NAME.arrange)"
+  else say "herdr: plugin link failed (try: herdr plugin link $ROOT)"; fi
+}
+herdr_unlink() {
+  command -v herdr >/dev/null || return 0
+  if herdr plugin unlink "$NAME" >/dev/null 2>&1; then say "herdr: plugin unlinked"; fi
+}
+
 # $1 = 1 to (re)add, 0 to only remove.
 codex_sync() {
   [ -d "$CODEX_DIR" ] || { say "codex: $CODEX_DIR not found, skipped"; return; }
@@ -122,6 +138,12 @@ status() {
   else
     say "claude:     not installed"
   fi
+  if command -v herdr >/dev/null && herdr plugin list --json 2>/dev/null \
+      | jq -e --arg n "$NAME" '.result.plugins[]? | select(.plugin_id == $n)' >/dev/null; then
+    say "herdr:      plugin linked"
+  else
+    say "herdr:      not linked"
+  fi
   if grep -qs "herdr-agent-panes" "$CODEX_DIR/hooks.json"; then say "codex:      guard hook set"
   else say "codex:      not installed"; fi
   if grep -qs "long-running-guard" "$HOME/.claude/settings.json"; then
@@ -137,13 +159,13 @@ status() {
 command -v jq >/dev/null || die "jq is required"
 case "${1:-}" in
   install)
-    link_bins; claude_install; codex_sync 1
+    link_bins; claude_install; herdr_link; codex_sync 1
     [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/$NAME/config.sh" ] \
       || say "config: optional, copy $ROOT/config.example.sh to ~/.config/$NAME/config.sh" ;;
-  uninstall) claude_uninstall; codex_sync 0; unlink_bins ;;
+  uninstall) claude_uninstall; herdr_unlink; codex_sync 0; unlink_bins ;;
   status) status ;;
   root) echo "$ROOT" ;;
   version|-v|--version) version ;;
-  ""|-h|--help|help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//' ;;
+  ""|-h|--help|help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) die "unknown command: $1 (try --help)" ;;
 esac

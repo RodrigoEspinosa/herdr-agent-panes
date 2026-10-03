@@ -28,12 +28,21 @@
 
 # ---- herdr-run ----
 
-# Where herdr-run opens a new pane next to the agent:
-#   auto   right when the agent pane is at least SPLIT_WIDE_COLS wide, else down
-#   right  always to the right
-#   down   always below
-# SPLIT_DIRECTION=auto
-# SPLIT_WIDE_COLS=160
+# Where new panes go:
+#   dock   one dock beside the agent pane: a column on the right when the agent
+#          pane is at least DOCK_WIDE_COLS wide, else a strip along the bottom.
+#          New panes stack inside the dock and never split the agent again.
+#   split  plain split next to the agent (right when wide, else down)
+# LAYOUT=dock
+# DOCK_WIDE_COLS=140
+# DOCK_COLS=64              # right dock width, clamped to 28-45% of the agent pane
+# DOCK_BOTTOM_PERCENT=30
+
+# Inside the dock, panes are ordered large, normal, small and share space 3:2:1.
+# herdr-run --size overrides the guess. Assigning an array replaces the default
+# list; use SMALL_PATTERNS+=(...) to extend it.
+# SMALL_PATTERNS+=('(^|[[:space:]])ngrok([[:space:]]|$)')
+# LARGE_PATTERNS=('storybook')
 
 # Lines of recent pane output herdr-run prints (--lines overrides it).
 # OUTPUT_LINES=40

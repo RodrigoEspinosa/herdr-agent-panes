@@ -1,11 +1,15 @@
 {
   "name": "herdr-agent-panes",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Inside herdr, keep agents' dev servers and watchers in visible panes (via herdr-run) instead of hidden background shells.",
   "author": {
     "name": "Rodrigo Espinosa Curbelo",
     "email": "espinosacurbelo@gmail.com"
   },
   "license": "MIT",
-  "keywords": ["herdr", "dev-server", "hooks"]
+  "keywords": [
+    "herdr",
+    "dev-server",
+    "hooks"
+  ]
 }

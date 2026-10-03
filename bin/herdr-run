@@ -3,6 +3,7 @@
 # pane, reusing an existing pane if that command is already running there.
 #
 #   herdr-run [options] -- <command...>
+#   herdr-run --arrange
 #   herdr-run --list
 #
 # Options:
@@ -12,8 +13,17 @@
 #   --wait REGEX     after starting, wait until pane output matches REGEX
 #   --timeout MS     timeout for --wait (default: 60000)
 #   --lines N        lines of recent output to print (default: OUTPUT_LINES, 40)
+#   --size SIZE      small | normal | large: the pane's share of the dock
+#                    (default: guessed from the command; databases, docker and
+#                    watchers are small)
 #   --restart        stop a running instance (Ctrl-C) and start it again
+#   --arrange        tidy this tab: move every non-agent pane into the dock
+#                    beside the agent pane, ordered and sized by --size (panes
+#                    herdr-run did not start are sized by what runs in them)
 #   --list           list panes this helper is tracking in the workspace
+#
+# New panes go into one dock beside the agent pane (right column when the agent
+# pane is wide, bottom strip otherwise) instead of splitting the agent again.
 #
 # Prints a "status=<running|started|restarted> pane=<id>" line followed by the
 # pane's recent output. Read more later with:
@@ -26,10 +36,14 @@ die() { echo "herdr-run: $*" >&2; exit 1; }
 [ "${HERDR_ENV:-}" = 1 ] || die "not running inside a Herdr pane (HERDR_ENV!=1)"
 command -v jq >/dev/null || die "jq is required"
 # Resolve the symlink in ~/.local/bin back to the checkout for the shared config.
+lib="$(dirname "$(readlink -f "$0")")/../scripts"
 # shellcheck source=scripts/config.sh
-. "$(dirname "$(readlink -f "$0")")/../scripts/config.sh"
+. "$lib/config.sh"
+# shellcheck source=scripts/layout.sh
+. "$lib/layout.sh"
 
 cwd="$PWD" match="" wait_re="" timeout=60000 lines="$OUTPUT_LINES" restart=0 list=0
+size="" arrange=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --cwd) cwd="$2"; shift 2 ;;
@@ -37,10 +51,12 @@ while [ $# -gt 0 ]; do
     --wait) wait_re="$2"; shift 2 ;;
     --timeout) timeout="$2"; shift 2 ;;
     --lines) lines="$2"; shift 2 ;;
+    --size) size="$2"; shift 2 ;;
     --restart) restart=1; shift ;;
+    --arrange) arrange=1; shift ;;
     --list) list=1; shift ;;
     --) shift; break ;;
-    -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) break ;;
   esac
 done
@@ -63,10 +79,33 @@ if [ "$list" = 1 ]; then
   exit 0
 fi
 
+me="${HERDR_PANE_ID:-}"
+if [ "$arrange" = 1 ]; then
+  [ -n "$me" ] || die "--arrange needs HERDR_PANE_ID (run it from the agent's pane)"
+  # Adopt every other pane in this tab that is not an agent, sized by what runs in it.
+  tab=$(jq -r --arg me "$me" '.result.panes[] | select(.pane_id == $me) | .tab_id' <<<"$panes_json")
+  for p in $(jq -r --arg me "$me" --arg t "$tab" \
+      '.result.panes[] | select(.tab_id == $t and .pane_id != $me and (.agent // "") == "") | .pane_id' <<<"$panes_json"); do
+    [ -e "$state_dir/${p//:/_}.json" ] && continue
+    c=$(herdr pane process-info --pane "$p" 2>/dev/null \
+      | jq -r '[.result.process_info.foreground_processes[]? | (.cmdline // .argv0 // .name)] | last // ""')
+    d=$(jq -r --arg p "$p" '.result.panes[] | select(.pane_id == $p) | (.foreground_cwd // .cwd)' <<<"$panes_json")
+    jq -n --arg pane "$p" --arg cmd "$c" --arg cwd "$d" --arg size "$(auto_size "$c")" \
+      '{pane:$pane, cmd:$cmd, cwd:$cwd, size:$size}' > "$state_dir/${p//:/_}.json"
+  done
+  dock=$(dock_panes "$(tab_layout "$me")")
+  [ -n "$dock" ] || { echo "herdr-run: nothing to arrange in this tab"; exit 0; }
+  # shellcheck disable=SC2086
+  redock "$me" $dock
+  echo "arranged: $(tr '\n' ' ' <<<"$dock")"
+  exit 0
+fi
+
 [ $# -gt 0 ] || die "missing command (usage: herdr-run [options] -- <command...>)"
 cmd="$*"
 cwd=$(cd "$cwd" && pwd -P) || die "no such directory: $cwd"
 [ -n "$match" ] || match=$(printf '%s' "$cmd" | sed 's/[][\.*^$+?(){}|/]/\\&/g')
+case "$size" in small|normal|large) ;; "") size=$(auto_size "$cmd") ;; *) die "--size must be small, normal or large" ;; esac
 
 fg_cmdlines() {
   herdr pane process-info --pane "$1" 2>/dev/null \
@@ -106,7 +145,8 @@ launch() {
     || echo "herdr-run: output did not match /$wait_re/ within ${timeout}ms" >&2
 }
 track() {
-  jq -n --arg pane "$1" --arg cmd "$cmd" --arg cwd "$cwd" '{pane:$pane, cmd:$cmd, cwd:$cwd}' > "$state_dir/${1//:/_}.json"
+  jq -n --arg pane "$1" --arg cmd "$cmd" --arg cwd "$cwd" --arg size "$size" \
+    '{pane:$pane, cmd:$cmd, cwd:$cwd, size:$size}' > "$state_dir/${1//:/_}.json"
 }
 
 # 1. Already running somewhere in this workspace (same cwd, matching process)?
@@ -140,21 +180,24 @@ for f in "$state_dir"/*; do
   launch "$p"; show restarted "$p"; exit 0
 done
 
-# 3. Spawn a sibling pane without stealing focus.
-dir="$SPLIT_DIRECTION"
-if [ "$dir" = auto ]; then
+# 3. Spawn a new pane: in the dock beside the agent, or a plain split.
+if [ "$LAYOUT" = dock ] && [ -n "$me" ]; then
+  new=$(spawn_docked "$me" "$cwd")
+else
   dir=down
-  width=$(herdr pane layout --pane "${HERDR_PANE_ID:-}" 2>/dev/null \
-    | jq -r --arg me "${HERDR_PANE_ID:-}" '.result.layout.panes[] | select(.pane_id == $me) | .rect.width' || true)
-  [ "${width:-0}" -ge "$SPLIT_WIDE_COLS" ] && dir=right
+  width=$(herdr pane layout --pane "$me" 2>/dev/null \
+    | jq -r --arg me "$me" '.result.layout.panes[] | select(.pane_id == $me) | .rect.width' || true)
+  [ "${width:-0}" -ge "$DOCK_WIDE_COLS" ] && dir=right
+  split_args=(--direction "$dir" --cwd "$cwd" --no-focus)
+  [ -n "$me" ] && split_args=(--current "${split_args[@]}")
+  new=$(herdr pane split "${split_args[@]}" | jq -r .result.pane.pane_id)
 fi
-split_args=(--direction "$dir" --cwd "$cwd" --no-focus)
-[ -n "${HERDR_PANE_ID:-}" ] && split_args=(--current "${split_args[@]}")
-new=$(herdr pane split "${split_args[@]}" | jq -r .result.pane.pane_id)
 [ -n "$new" ] && [ "$new" != null ] || die "failed to create pane"
 # Let the shell reach its prompt before typing into it.
 for _ in $(seq 1 20); do
   [ -n "$(herdr pane read "$new" --source visible 2>/dev/null | tr -d '[:space:]')" ] && is_idle_shell "$new" && break
   sleep 0.25
 done
+track "$new"
+[ "$LAYOUT" = dock ] && [ -n "$me" ] && settle_dock "$me"
 launch "$new"; show started "$new"

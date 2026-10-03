@@ -17,6 +17,26 @@ sends that work to `herdr-run`, which:
 and prints the pane ID plus recent output so the agent can read logs later
 with `herdr pane read`.
 
+New panes don't pile up wherever there's room. The agent's chat stays the main
+pane and everything herdr-run starts goes into one dock beside it:
+
+```
+wide agent pane (≥140 cols)          narrow agent pane
+┌──────────────────┬─────────┐       ┌────────────────────────────┐
+│                  │ app dev │       │                            │
+│                  │ (large) │       │        agent chat          │
+│    agent chat    ├─────────┤       │                            │
+│                  │  api    │       ├──────────┬───────┬─────────┤
+│                  ├─────────┤       │ app dev  │  api  │ db      │
+│                  │ db      │       └──────────┴───────┴─────────┘
+└──────────────────┴─────────┘
+```
+
+Panes are ordered and sized by `--size` (`large` 3, `normal` 2, `small` 1), so
+a database or `docker compose` log doesn't take as much room as the server
+you're working on. `herdr-run --arrange` tidies an existing tab into this
+layout, adopting panes you opened yourself.
+
 Outside herdr (`HERDR_ENV` unset) everything here is a no-op.
 
 ## What's in it
@@ -24,6 +44,7 @@ Outside herdr (`HERDR_ENV` unset) everything here is a no-op.
 | Piece | What it does |
 | --- | --- |
 | `bin/herdr-run` | Run a command in a reused or new pane. `herdr-run --help` lists options. |
+| `scripts/layout.sh` | The dock layout used by `herdr-run`. |
 | `scripts/guard.sh` | PreToolUse hook. Denies dev servers, watchers and `docker compose up` (without `-d`) run through the agent's shell, and suggests the matching `herdr-run` command. Commands prefixed with `timeout N` pass. |
 | `bin/herdr-agent-panes` | `install`, `uninstall`, `status`. Wires everything into Claude Code and Codex. |
 | `scripts/session-context.sh` | SessionStart hook (Claude Code). Adds `instructions.md` to the agent's context, only inside herdr. |
@@ -86,7 +107,9 @@ so changes apply immediately.
 
 - `MODE`: `deny` (default), `warn` (let it run with a reminder) or `off`
 - `EXTRA_PATTERNS` / `ALLOW_PATTERNS`: add commands to block, or exempt some
-- `SPLIT_DIRECTION`, `SPLIT_WIDE_COLS`: where new panes open
+- `LAYOUT` (`dock` or `split`), `DOCK_WIDE_COLS`, `DOCK_COLS`,
+  `DOCK_BOTTOM_PERCENT`: where the dock goes and how big it is
+- `SMALL_PATTERNS` / `LARGE_PATTERNS`: which commands get less or more room
 - `OUTPUT_LINES`: how much output `herdr-run` prints
 
 ## Development

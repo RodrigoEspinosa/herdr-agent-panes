@@ -1,0 +1,15 @@
+id = "herdr-agent-panes"
+name = "Herdr Agent Panes"
+version = "0.2.0"
+min_herdr_version = "0.7.3"
+description = "Keep coding agents' dev servers and watchers in visible panes, docked beside the agent's chat. The arrange action tidies the focused tab into that layout."
+platforms = ["linux", "macos"]
+
+# Tidy the focused tab: every non-agent pane moves into the dock beside the
+# agent's pane, ordered and sized by importance. Same as `herdr-run --arrange`.
+#   herdr plugin action invoke herdr-agent-panes.arrange
+[[actions]]
+id = "arrange"
+title = "Agent Panes: arrange this tab"
+contexts = ["global"]
+command = ["bash", "scripts/arrange-action.sh"]
