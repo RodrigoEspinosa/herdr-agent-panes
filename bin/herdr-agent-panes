@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# herdr-agent-panes — wire the herdr-run guard and instructions into coding agents.
+#
+#   herdr-agent-panes install     install, or refresh after an upgrade / git pull
+#   herdr-agent-panes uninstall   remove everything install added
+#   herdr-agent-panes status      show what is wired up
+#   herdr-agent-panes root        print the install root the hooks run from
+#   herdr-agent-panes version
+#
+# install touches:
+#   PATH        herdr-run and herdr-agent-panes symlinks in $BIN_DIR (default
+#               ~/.local/bin); skipped for Homebrew, which links them itself
+#   Claude Code adds the root as a marketplace and installs the plugin
+#   Codex       PreToolUse guard in ~/.codex/hooks.json and the instructions as
+#               a marked block in ~/.codex/AGENTS.md
+#
+# Every hook runs scripts from `root`, which stays put across upgrades (a git
+# checkout, or Homebrew's opt prefix), so upgrading the files upgrades the hooks.
+# Re-run install after an upgrade only to resync the Codex AGENTS.md block.
+set -euo pipefail
+
+NAME=herdr-agent-panes
+# Homebrew's wrapper sets HERDR_AGENT_PANES_ROOT to the version-independent opt
+# path; otherwise this is a checkout and the root is next to this script.
+ROOT="${HERDR_AGENT_PANES_ROOT:-$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd -P)}"
+BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
+CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
+START="<!-- $NAME:start (managed by \`$NAME install\`; edits here are overwritten) -->"
+END="<!-- $NAME:end -->"
+
+say() { printf '%s\n' "$*"; }
+die() { printf '%s: %s\n' "$NAME" "$*" >&2; exit 1; }
+version() { jq -r .version "$ROOT/.claude-plugin/plugin.json"; }
+managed_by_brew() { [ -n "${HERDR_AGENT_PANES_ROOT:-}" ]; }
+
+link_bins() {
+  managed_by_brew && { say "path: managed by Homebrew"; return; }
+  mkdir -p "$BIN_DIR"
+  local b link
+  for b in herdr-run "$NAME"; do
+    link="$BIN_DIR/$b"
+    if [ -e "$link" ] && [ ! -L "$link" ]; then
+      mv "$link" "$link.bak"; say "path: moved existing $link to $link.bak"
+    fi
+    ln -sfn "$ROOT/bin/$b" "$link"
+  done
+  say "path: herdr-run, $NAME -> $BIN_DIR"
+  case ":$PATH:" in *":$BIN_DIR:"*) ;; *) say "path: note, $BIN_DIR is not on PATH" ;; esac
+}
+unlink_bins() {
+  managed_by_brew && return
+  local b link
+  for b in herdr-run "$NAME"; do
+    link="$BIN_DIR/$b"
+    if [ -L "$link" ] && [ "$(readlink "$link")" = "$ROOT/bin/$b" ]; then rm "$link"; fi
+  done
+  say "path: links removed from $BIN_DIR"
+}
+
+claude_install() {
+  command -v claude >/dev/null || { say "claude: not found, skipped"; return; }
+  # A marketplace already registered at another path (old checkout, or a clone
+  # before switching to Homebrew) has to be re-added to point at this root.
+  local src
+  src=$(jq -r --arg n "$NAME" '.[$n].source.path // empty' "$HOME/.claude/plugins/known_marketplaces.json" 2>/dev/null || true)
+  if [ -n "$src" ] && [ "$src" != "$ROOT" ]; then
+    claude plugin uninstall "$NAME@$NAME" >/dev/null 2>&1 || true
+    claude plugin marketplace remove "$NAME" >/dev/null 2>&1 || true
+  fi
+  claude plugin marketplace add "$ROOT" >/dev/null 2>&1 \
+    || claude plugin marketplace update "$NAME" >/dev/null 2>&1 || true
+  if claude plugin list 2>/dev/null | grep -q "$NAME@$NAME"; then
+    claude plugin update "$NAME@$NAME" >/dev/null 2>&1 || true
+    say "claude: plugin up to date (restart sessions to apply)"
+  else
+    claude plugin install "$NAME@$NAME" >/dev/null || die "claude plugin install failed"
+    say "claude: plugin installed (restart sessions to apply)"
+  fi
+}
+claude_uninstall() {
+  command -v claude >/dev/null || return 0
+  claude plugin uninstall "$NAME@$NAME" >/dev/null 2>&1 || true
+  claude plugin marketplace remove "$NAME" >/dev/null 2>&1 || true
+  say "claude: plugin and marketplace removed"
+}
+
+# $1 = 1 to (re)add, 0 to only remove.
+codex_sync() {
+  [ -d "$CODEX_DIR" ] || { say "codex: $CODEX_DIR not found, skipped"; return; }
+  local hooks="$CODEX_DIR/hooks.json" agents="$CODEX_DIR/AGENTS.md"
+  [ -f "$hooks" ] || echo '{"hooks":{}}' > "$hooks"
+  # Drop any earlier copy of the guard (this tool from any root, or the
+  # pre-plugin long-running-guard.sh), then add the current one.
+  jq --arg cmd "bash '$ROOT/scripts/guard.sh'" --argjson add "$1" '
+    def ours: (.command // "") | test("herdr-agent-panes|long-running-guard\\.sh");
+    .hooks.PreToolUse = ([(.hooks.PreToolUse // [])[]
+        | .hooks |= map(select(ours | not)) | select(.hooks | length > 0)]
+      + (if $add == 1 then [{hooks: [{type: "command", command: $cmd, timeout: 10}]}] else [] end))
+    | if (.hooks.PreToolUse | length) == 0 then del(.hooks.PreToolUse) else . end
+  ' "$hooks" > "$hooks.tmp" && mv "$hooks.tmp" "$hooks"
+
+  touch "$agents"
+  awk -v e="$END" '
+    index($0, "<!-- herdr-agent-panes:start") == 1 { skip = 1; next }
+    skip && $0 == e { skip = 0; next }
+    !skip
+  ' "$agents" > "$agents.tmp"
+  if [ "$1" = 1 ]; then
+    [ -s "$agents.tmp" ] && [ -n "$(tail -c1 "$agents.tmp")" ] && echo >> "$agents.tmp"
+    { echo "$START"; cat "$ROOT/instructions.md"; echo "$END"; } >> "$agents.tmp"
+  fi
+  mv "$agents.tmp" "$agents"
+  if [ "$1" = 1 ]; then say "codex: guard hook and AGENTS.md block synced"
+  else say "codex: guard hook and AGENTS.md block removed"; fi
+}
+
+status() {
+  say "$NAME $(version)  root: $ROOT$(managed_by_brew && echo ' (Homebrew)')"
+  say "herdr-run:  $(command -v herdr-run || echo 'not on PATH')"
+  if command -v claude >/dev/null && claude plugin list 2>/dev/null | grep -q "$NAME@$NAME"; then
+    say "claude:     plugin installed"
+  else
+    say "claude:     not installed"
+  fi
+  if grep -qs "herdr-agent-panes" "$CODEX_DIR/hooks.json"; then say "codex:      guard hook set"
+  else say "codex:      not installed"; fi
+  if grep -qs "long-running-guard" "$HOME/.claude/settings.json"; then
+    say "warning:    ~/.claude/settings.json still has the old long-running-guard hook"
+  fi
+  if grep -qs "^## Long-running processes in Herdr" "$HOME/.claude/CLAUDE.md"; then
+    say "warning:    ~/.claude/CLAUDE.md still has the old herdr-run section"
+  fi
+  local cfg="${XDG_CONFIG_HOME:-$HOME/.config}/$NAME/config.sh"
+  say "config:     $([ -f "$cfg" ] && echo "$cfg" || echo "none (see $ROOT/config.example.sh)")"
+}
+
+command -v jq >/dev/null || die "jq is required"
+case "${1:-}" in
+  install)
+    link_bins; claude_install; codex_sync 1
+    [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/$NAME/config.sh" ] \
+      || say "config: optional, copy $ROOT/config.example.sh to ~/.config/$NAME/config.sh" ;;
+  uninstall) claude_uninstall; codex_sync 0; unlink_bins ;;
+  status) status ;;
+  root) echo "$ROOT" ;;
+  version|-v|--version) version ;;
+  ""|-h|--help|help) sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown command: $1 (try --help)" ;;
+esac

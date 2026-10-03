@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# herdr-run — run a long-lived command (dev server, watcher, …) in its own Herdr
+# pane, reusing an existing pane if that command is already running there.
+#
+#   herdr-run [options] -- <command...>
+#   herdr-run --list
+#
+# Options:
+#   --cwd DIR        directory to run in (default: $PWD)
+#   --match REGEX    regex to detect an already-running instance
+#                    (default: the command text itself)
+#   --wait REGEX     after starting, wait until pane output matches REGEX
+#   --timeout MS     timeout for --wait (default: 60000)
+#   --lines N        lines of recent output to print (default: OUTPUT_LINES, 40)
+#   --restart        stop a running instance (Ctrl-C) and start it again
+#   --list           list panes this helper is tracking in the workspace
+#
+# Prints a "status=<running|started|restarted> pane=<id>" line followed by the
+# pane's recent output. Read more later with:
+#   herdr pane read <id> --source recent-unwrapped --lines 120
+#
+# Defaults come from ~/.config/herdr-agent-panes/config.sh (see config.example.sh).
+set -euo pipefail
+
+die() { echo "herdr-run: $*" >&2; exit 1; }
+[ "${HERDR_ENV:-}" = 1 ] || die "not running inside a Herdr pane (HERDR_ENV!=1)"
+command -v jq >/dev/null || die "jq is required"
+# Resolve the symlink in ~/.local/bin back to the checkout for the shared config.
+# shellcheck source=scripts/config.sh
+. "$(dirname "$(readlink -f "$0")")/../scripts/config.sh"
+
+cwd="$PWD" match="" wait_re="" timeout=60000 lines="$OUTPUT_LINES" restart=0 list=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --cwd) cwd="$2"; shift 2 ;;
+    --match) match="$2"; shift 2 ;;
+    --wait) wait_re="$2"; shift 2 ;;
+    --timeout) timeout="$2"; shift 2 ;;
+    --lines) lines="$2"; shift 2 ;;
+    --restart) restart=1; shift ;;
+    --list) list=1; shift ;;
+    --) shift; break ;;
+    -h|--help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) break ;;
+  esac
+done
+
+ws="${HERDR_WORKSPACE_ID:?}"
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/herdr-run/${ws//:/_}"
+mkdir -p "$state_dir"
+
+panes_json=$(herdr pane list --workspace "$ws")
+pane_alive() { jq -e --arg p "$1" '.result.panes[] | select(.pane_id == $p)' <<<"$panes_json" >/dev/null; }
+
+# Forget tracked panes that no longer exist.
+for f in "$state_dir"/*; do
+  [ -e "$f" ] || continue
+  pane_alive "$(jq -r .pane "$f")" || rm -f "$f"
+done
+
+if [ "$list" = 1 ]; then
+  for f in "$state_dir"/*; do [ -e "$f" ] && jq -c . "$f"; done
+  exit 0
+fi
+
+[ $# -gt 0 ] || die "missing command (usage: herdr-run [options] -- <command...>)"
+cmd="$*"
+cwd=$(cd "$cwd" && pwd -P) || die "no such directory: $cwd"
+[ -n "$match" ] || match=$(printf '%s' "$cmd" | sed 's/[][\.*^$+?(){}|/]/\\&/g')
+
+fg_cmdlines() {
+  herdr pane process-info --pane "$1" 2>/dev/null \
+    | jq -r '.result.process_info.foreground_processes[]? | (.cmdline // .argv0 // .name)'
+}
+is_idle_shell() {
+  # Only a shell in the foreground -> the previous command exited.
+  local procs; procs=$(fg_cmdlines "$1")
+  [ -z "$procs" ] || ! grep -qvE '^-?(zsh|bash|fish|sh|nu)( |$)' <<<"$procs"
+}
+same_cwd() {
+  local c; c=$(jq -r --arg p "$1" '.result.panes[] | select(.pane_id == $p) | (.foreground_cwd // .cwd)' <<<"$panes_json")
+  [ -n "$c" ] && [ "$(cd "$c" 2>/dev/null && pwd -P)" = "$cwd" ]
+}
+show() {
+  echo "status=$1 pane=$2"
+  echo "--- recent output ($2) ---"
+  herdr pane read "$2" --source recent-unwrapped --lines "$lines" 2>/dev/null || true
+}
+clear_pane() {
+  # Run `clear` (optionally after a cd) and wait until the screen is actually blank.
+  herdr pane run "$1" "${2:+cd $(printf '%q' "$2") && }clear" >/dev/null
+  for _ in $(seq 1 20); do
+    [ "$(herdr pane read "$1" --source visible 2>/dev/null | tr -d '[:space:]' | wc -c)" -lt 200 ] \
+      && is_idle_shell "$1" && break
+    sleep 0.25
+  done
+}
+launch() {
+  # Type the command, wait for it to take over the foreground, then for --wait.
+  # Readiness is matched on the visible screen: scrollback can hold a stale match.
+  herdr pane run "$1" "$cmd" >/dev/null
+  track "$1"
+  for _ in $(seq 1 20); do is_idle_shell "$1" || break; sleep 0.25; done
+  if [ -z "$wait_re" ]; then sleep 2; return 0; fi
+  herdr pane wait-output "$1" --regex "$wait_re" --source visible --timeout "$timeout" >/dev/null \
+    || echo "herdr-run: output did not match /$wait_re/ within ${timeout}ms" >&2
+}
+track() {
+  jq -n --arg pane "$1" --arg cmd "$cmd" --arg cwd "$cwd" '{pane:$pane, cmd:$cmd, cwd:$cwd}' > "$state_dir/${1//:/_}.json"
+}
+
+# 1. Already running somewhere in this workspace (same cwd, matching process)?
+running=""
+for p in $(jq -r --arg me "${HERDR_PANE_ID:-}" '.result.panes[] | select(.pane_id != $me and (.agent // "") == "") | .pane_id' <<<"$panes_json"); do
+  same_cwd "$p" || continue
+  is_idle_shell "$p" && continue
+  title=$(jq -r --arg p "$p" '.result.panes[] | select(.pane_id == $p) | .terminal_title_stripped // .terminal_title // ""' <<<"$panes_json")
+  if [ "$title" = "$cmd" ] || { [ -n "$title" ] && grep -qE -- "$match" <<<"$title"; } \
+     || fg_cmdlines "$p" | grep -qE -- "$match"; then
+    running="$p"; break
+  fi
+done
+
+if [ -n "$running" ]; then
+  if [ "$restart" = 0 ]; then show running "$running"; exit 0; fi
+  herdr pane send-keys "$running" ctrl+c >/dev/null
+  for _ in $(seq 1 20); do is_idle_shell "$running" && break; sleep 0.5; done
+  is_idle_shell "$running" || die "pane $running did not stop after Ctrl-C"
+  clear_pane "$running"
+  launch "$running"; show restarted "$running"; exit 0
+fi
+
+# 2. A pane we spawned earlier for this command, now sitting at a shell prompt?
+for f in "$state_dir"/*; do
+  [ -e "$f" ] || continue
+  p=$(jq -r .pane "$f")
+  [ "$(jq -r .cmd "$f")" = "$cmd" ] && [ "$(jq -r .cwd "$f")" = "$cwd" ] || continue
+  is_idle_shell "$p" || continue
+  clear_pane "$p" "$cwd"
+  launch "$p"; show restarted "$p"; exit 0
+done
+
+# 3. Spawn a sibling pane without stealing focus.
+dir="$SPLIT_DIRECTION"
+if [ "$dir" = auto ]; then
+  dir=down
+  width=$(herdr pane layout --pane "${HERDR_PANE_ID:-}" 2>/dev/null \
+    | jq -r --arg me "${HERDR_PANE_ID:-}" '.result.layout.panes[] | select(.pane_id == $me) | .rect.width' || true)
+  [ "${width:-0}" -ge "$SPLIT_WIDE_COLS" ] && dir=right
+fi
+split_args=(--direction "$dir" --cwd "$cwd" --no-focus)
+[ -n "${HERDR_PANE_ID:-}" ] && split_args=(--current "${split_args[@]}")
+new=$(herdr pane split "${split_args[@]}" | jq -r .result.pane.pane_id)
+[ -n "$new" ] && [ "$new" != null ] || die "failed to create pane"
+# Let the shell reach its prompt before typing into it.
+for _ in $(seq 1 20); do
+  [ -n "$(herdr pane read "$new" --source visible 2>/dev/null | tr -d '[:space:]')" ] && is_idle_shell "$new" && break
+  sleep 0.25
+done
+launch "$new"; show started "$new"

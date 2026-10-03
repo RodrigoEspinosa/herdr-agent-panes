@@ -1,0 +1,15 @@
+{
+  "name": "herdr-agent-panes",
+  "description": "Keep coding agents' dev servers and watchers in visible herdr panes.",
+  "owner": {
+    "name": "Rodrigo Espinosa Curbelo",
+    "email": "espinosacurbelo@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "herdr-agent-panes",
+      "source": "./",
+      "description": "Inside herdr, keep agents' dev servers and watchers in visible panes (via herdr-run) instead of hidden background shells."
+    }
+  ]
+}
